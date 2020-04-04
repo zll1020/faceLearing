@@ -1,0 +1,526 @@
+
+Elastic-Job部分原理
+
+服务器初始化，节点选举和通知
+任务初始化
+Elastic-Job在构造任务JobScheduler时会进行初始化后将任务名称添加到zk的命名空间中。
+addJob时调用SpringJobScheduler的SpringJobScheduler，继承JobScheduler
+    public SpringJobScheduler(ElasticJob elasticJob, CoordinatorRegistryCenter regCenter, LiteJobConfiguration jobConfig, JobEventConfiguration jobEventConfig, ElasticJobListener... elasticJobListeners) {
+        super(regCenter, jobConfig, jobEventConfig, getTargetElasticJobListeners(elasticJobListeners));
+        this.elasticJob = elasticJob;
+    }
+
+    public JobScheduler(CoordinatorRegistryCenter regCenter, LiteJobConfiguration liteJobConfig, JobEventConfiguration jobEventConfig, ElasticJobListener... elasticJobListeners) {
+        this(regCenter, liteJobConfig, new JobEventBus(jobEventConfig), elasticJobListeners);
+    }
+    private JobScheduler(CoordinatorRegistryCenter regCenter, LiteJobConfiguration liteJobConfig, JobEventBus jobEventBus, ElasticJobListener... elasticJobListeners) {
+        JobRegistry.getInstance().addJobInstance(liteJobConfig.getJobName(), new JobInstance());
+        this.liteJobConfig = liteJobConfig;
+        this.regCenter = regCenter;
+        List<ElasticJobListener> elasticJobListenerList = Arrays.asList(elasticJobListeners);
+        this.setGuaranteeServiceForElasticJobListeners(regCenter, elasticJobListenerList);
+        this.schedulerFacade = new SchedulerFacade(regCenter, liteJobConfig.getJobName(), elasticJobListenerList);
+        this.jobFacade = new LiteJobFacade(regCenter, liteJobConfig.getJobName(), Arrays.asList(elasticJobListeners), jobEventBus);
+    }
+    public LiteJobFacade(CoordinatorRegistryCenter regCenter, String jobName, List<ElasticJobListener> elasticJobListeners, JobEventBus jobEventBus) {
+        this.configService = new ConfigurationService(regCenter, jobName);
+        this.shardingService = new ShardingService(regCenter, jobName);
+        this.executionContextService = new ExecutionContextService(regCenter, jobName);
+        this.executionService = new ExecutionService(regCenter, jobName);
+        this.failoverService = new FailoverService(regCenter, jobName);
+        this.elasticJobListeners = elasticJobListeners;
+        this.jobEventBus = jobEventBus;
+    }
+
+    构造完对象，调用init方法
+    public void init() {
+        LiteJobConfiguration liteJobConfigFromRegCenter = this.schedulerFacade.updateJobConfiguration(this.liteJobConfig);
+        JobRegistry.getInstance().setCurrentShardingTotalCount(liteJobConfigFromRegCenter.getJobName(), liteJobConfigFromRegCenter.getTypeConfig().getCoreConfig().getShardingTotalCount());
+        JobScheduleController jobScheduleController = new JobScheduleController(this.createScheduler(), this.createJobDetail(liteJobConfigFromRegCenter.getTypeConfig().getJobClass()), liteJobConfigFromRegCenter.getJobName());
+        //注册任务
+        JobRegistry.getInstance().registerJob(liteJobConfigFromRegCenter.getJobName(), jobScheduleController, this.regCenter);
+        //添加任务信息并进行节点选举
+        this.schedulerFacade.registerStartUpInfo(!liteJobConfigFromRegCenter.isDisabled());
+        jobScheduleController.scheduleJob(liteJobConfigFromRegCenter.getTypeConfig().getCoreConfig().getCron());
+    }
+
+    任务注册
+    调用JobRegistry的registerJob方法进行任务注册
+    public void registerJob(String jobName, JobScheduleController jobScheduleController, CoordinatorRegistryCenter regCenter) {
+        this.schedulerMap.put(jobName, jobScheduleController);
+        this.regCenterMap.put(jobName, regCenter);
+        //在registerJob方法中会调用ZookeeperRegistryCenter的addCacheData方法将任务名称作为节点名称写到zk中
+        regCenter.addCacheData("/" + jobName);
+    }
+    //ZK实现
+    public void addCacheData(String cachePath) {
+        TreeCache cache = new TreeCache(this.client, cachePath);
+
+        try {
+            cache.start();
+        } catch (Exception var4) {
+            RegExceptionHandler.handleException(var4);
+        }
+
+        this.caches.put(cachePath + "/", cache);
+    }
+
+    节点选举
+    public void registerStartUpInfo(boolean enabled) {
+        //启动所有的监听器
+        this.listenerManager.startAllListeners();
+        //节点选举
+        this.leaderService.electLeader();
+        //服务信息持久化
+        this.serverService.persistOnline(enabled);
+        //实力信息持久化
+        this.instanceService.persistOnline();
+        //重新分片
+        this.shardingService.setReshardingFlag();
+        //监控信息监听器
+        this.monitorService.listen();
+        if (!this.reconcileService.isRunning()) {
+            this.reconcileService.startAsync();
+        }
+    }
+    所有的监听器
+    public void startAllListeners() {
+        //主节点选举监听管理器
+        this.electionListenerManager.start();
+        //分片监听管理器
+        this.shardingListenerManager.start();
+        //失效转移
+        this.failoverListenerManager.start();
+        //幂等性
+        this.monitorExecutionListenerManager.start();
+        //运行实例关闭
+        this.shutdownListenerManager.start();
+        //作业触发
+        this.triggerListenerManager.start();
+        //重调度
+        this.rescheduleListenerManager.start();
+        //保证分布式任务全部开始和结束状态
+        this.guaranteeListenerManager.start();
+        //注册链接状态
+        this.jobNodeStorage.addConnectionStateListener(this.regCenterConnectionStateListener);
+    }
+
+    节点选举
+    在LeaderService方法中调用electLeader方法进行节点选举，在路径中写入leader/election/latch，如果选举成功在在leader/election/instance路径中填写服务器信息。
+        public void electLeader() {
+            log.debug("Elect a new leader now.");
+            this.jobNodeStorage.executeInLeader("leader/election/latch", new LeaderService.LeaderElectionExecutionCallback());
+            log.debug("Leader election completed.");
+        }
+        在JobNodeStoreage中调用executeInLeader方法，使用路径leader/election/latch，如果获取这个路径则调用LeaderExecutionCallback回调函数，执行execute方法。
+        public void executeInLeader(String latchNode, LeaderExecutionCallback callback) {
+            try {
+                LeaderLatch latch = new LeaderLatch(this.getClient(), this.jobNodePath.getFullPath(latchNode));
+                Throwable var4 = null;
+
+                try {
+                    latch.start();
+                    latch.await();
+                    callback.execute();
+                } catch (Throwable var14) {
+                    var4 = var14;
+                    throw var14;
+                } finally {
+                    if (latch != null) {
+                        if (var4 != null) {
+                            try {
+                                latch.close();
+                            } catch (Throwable var13) {
+                                var4.addSuppressed(var13);
+                            }
+                        } else {
+                            latch.close();
+                        }
+                    }
+
+                }
+            } catch (Exception var16) {
+                this.handleException(var16);
+            }
+        }
+        在LeaderExecutionCallback的execute方法中会判断是否选举为主节点，如果选举为主节点则将服务器信息添加到leader/election/instace路径中
+        class LeaderElectionExecutionCallback implements LeaderExecutionCallback {
+            public void execute() {
+                if (!LeaderService.this.hasLeader()) {
+                    LeaderService.this.jobNodeStorage.fillEphemeralJobNode("leader/election/instance", JobRegistry.getInstance().getJobInstance(LeaderService.this.jobName).getJobInstanceId());
+                }
+
+            }
+
+            public LeaderElectionExecutionCallback() {
+            }
+        }
+        //判断是否已经有主节点
+        public boolean hasLeader() {
+            return this.jobNodeStorage.isJobNodeExisted("leader/election/instance");
+        }
+
+        将服务信息添加到ZK中
+        public void persistOnline(boolean enabled) {
+            if (!JobRegistry.getInstance().isShutdown(this.jobName)) {
+                this.jobNodeStorage.fillJobNode(this.serverNode.getServerNode(JobRegistry.getInstance().getJobInstance(this.jobName).getIp()), enabled ? "" : ServerStatus.DISABLED.name());
+            }
+        }
+
+        将实例的信息初始化到zk的instances节点中
+        public void persistOnline() {
+            this.jobNodeStorage.fillEphemeralJobNode(this.instanceNode.getLocalInstanceNode(), "");
+        }
+
+        在ShardingService中调用setReshardingFlag方法，在节点sharding写创建necessary节点，通知主节点进行任务分片处理。
+        public void setReshardingFlag() {
+            this.jobNodeStorage.createJobNodeIfNeeded("leader/sharding/necessary");
+        }
+
+        Elastic-Job使用zk节点信息变化通知的机制，众多监听器
+
+任务分片与策略
+    目前提供了三种任务分片策略，分片策略的实现最终是在注册中心zk中在分片的instance中写入实例信息
+
+    目前提供分片接口：JobShardingStrategy，有三个实现类
+    AverageAllocationJobShardingStrategy
+    //根据整出规则，将整除后的数据进行分配
+    private Map<JobInstance, List<Integer>> shardingAliquot(List<JobInstance> shardingUnits, int shardingTotalCount) {
+        Map<JobInstance, List<Integer>> result = new LinkedHashMap(shardingTotalCount, 1.0F);
+        int itemCountPerSharding = shardingTotalCount / shardingUnits.size();
+        int count = 0;
+        for(Iterator i$ = shardingUnits.iterator(); i$.hasNext(); ++count) {
+            JobInstance each = (JobInstance)i$.next();
+            List<Integer> shardingItems = new ArrayList(itemCountPerSharding + 1);
+            for(int i = count * itemCountPerSharding; i < (count + 1) * itemCountPerSharding; ++i) {
+                shardingItems.add(i);
+            }
+            result.put(each, shardingItems);
+        }
+        return result;
+    }
+    //无法整除分片的数据，依次追加到实例中
+    private void addAliquant(List<JobInstance> shardingUnits, int shardingTotalCount, Map<JobInstance, List<Integer>> shardingResults) {
+        int aliquant = shardingTotalCount % shardingUnits.size();
+        int count = 0;
+        for(Iterator i$ = shardingResults.entrySet().iterator(); i$.hasNext(); ++count) {
+            Entry<JobInstance, List<Integer>> entry = (Entry)i$.next();
+            if (count < aliquant) {
+                ((List)entry.getValue()).add(shardingTotalCount / shardingUnits.size() * shardingUnits.size() + count);
+            }
+        }
+    }
+
+    OdevitySortByNameJobShardingStrategy
+    public Map<JobInstance, List<Integer>> sharding(List<JobInstance> jobInstances, String jobName, int shardingTotalCount) {
+        long jobNameHash = (long)jobName.hashCode();
+        if (0L == jobNameHash % 2L) {
+            Collections.reverse(jobInstances);
+        }
+
+        return this.averageAllocationJobShardingStrategy.sharding(jobInstances, jobName, shardingTotalCount);
+    }
+
+    RotateServerByNameJobShardingStrategy
+    public Map<JobInstance, List<Integer>> sharding(List<JobInstance> jobInstances, String jobName, int shardingTotalCount) {
+        return this.averageAllocationJobShardingStrategy.sharding(this.rotateServerList(jobInstances, jobName), jobName, shardingTotalCount);
+    }
+
+    private List<JobInstance> rotateServerList(List<JobInstance> shardingUnits, String jobName) {
+        int shardingUnitsSize = shardingUnits.size();
+        int offset = Math.abs(jobName.hashCode()) % shardingUnitsSize;
+        if (0 == offset) {
+            return shardingUnits;
+        } else {
+            List<JobInstance> result = new ArrayList(shardingUnitsSize);
+
+            for(int i = 0; i < shardingUnitsSize; ++i) {
+                int index = (i + offset) % shardingUnitsSize;
+                result.add(shardingUnits.get(index));
+            }
+
+            return result;
+        }
+    }
+    总体上使用的还是平均分片算法，不过是将实例进行了不同的排序操作。
+
+任务调度处理
+Elastic-Job的定时任务执行机制还是基于quartz开发的，因此Elastic-Job实现了Quartz的任务接口Job实现了LiteJob，来根据定时任务规则执行定时任务。
+实现了quartz的Job LiteJob
+    public final class LiteJob implements Job {
+        private ElasticJob elasticJob;
+        private JobFacade jobFacade;
+
+        public LiteJob() {
+        }
+
+        public void execute(JobExecutionContext context) throws JobExecutionException {
+            JobExecutorFactory.getJobExecutor(this.elasticJob, this.jobFacade).execute();
+        }
+
+        public void setElasticJob(ElasticJob elasticJob) {
+            this.elasticJob = elasticJob;
+        }
+
+        public void setJobFacade(JobFacade jobFacade) {
+            this.jobFacade = jobFacade;
+        }
+    }
+    根据任务类型JobExecutorFactory会获取任务执行器，然后调用execute方法
+    public static AbstractElasticJobExecutor getJobExecutor(ElasticJob elasticJob, JobFacade jobFacade) {
+        if (null == elasticJob) {
+            return new ScriptJobExecutor(jobFacade);
+        } else if (elasticJob instanceof SimpleJob) {
+            return new SimpleJobExecutor((SimpleJob)elasticJob, jobFacade);
+        } else if (elasticJob instanceof DataflowJob) {
+            return new DataflowJobExecutor((DataflowJob)elasticJob, jobFacade);
+        } else {
+            throw new JobConfigurationException("Cannot support job type '%s'", new Object[]{elasticJob.getClass().getCanonicalName()});
+        }
+    }
+    Elastic-Job提供了任务执行器抽象类AbstractElasticJobExecutor，在AbstractElasticJobExecutor中会获取任务分片信息及任务失败转移等处理操作。
+    在execute中会获取所有的分片信息，及一系列的处理操作。
+    //执行作业
+    public final void execute() {
+        try {
+            this.jobFacade.checkJobExecutionEnvironment();
+        } catch (JobExecutionEnvironmentException var5) {
+            this.jobExceptionHandler.handleException(this.jobName, var5);
+        }
+        //获取分片信息
+        ShardingContexts shardingContexts = this.jobFacade.getShardingContexts();
+        if (shardingContexts.isAllowSendJobEvent()) {
+            this.jobFacade.postJobStatusTraceEvent(shardingContexts.getTaskId(), State.TASK_STAGING, String.format("Job '%s' execute begin.", this.jobName));
+        }
+
+        if (this.jobFacade.misfireIfRunning(shardingContexts.getShardingItemParameters().keySet())) {
+            if (shardingContexts.isAllowSendJobEvent()) {
+                this.jobFacade.postJobStatusTraceEvent(shardingContexts.getTaskId(), State.TASK_FINISHED, String.format("Previous job '%s' - shardingItems '%s' is still running, misfired job will start after previous job completed.", this.jobName, shardingContexts.getShardingItemParameters().keySet()));
+            }
+
+        } else {
+            try {
+                this.jobFacade.beforeJobExecuted(shardingContexts);
+            } catch (Throwable var4) {
+                this.jobExceptionHandler.handleException(this.jobName, var4);
+            }
+            //执行分片任务
+            this.execute(shardingContexts, ExecutionSource.NORMAL_TRIGGER);
+
+            while(this.jobFacade.isExecuteMisfired(shardingContexts.getShardingItemParameters().keySet())) {
+                this.jobFacade.clearMisfire(shardingContexts.getShardingItemParameters().keySet());
+                this.execute(shardingContexts, ExecutionSource.MISFIRE);
+            }
+
+            this.jobFacade.failoverIfNecessary();
+
+            try {
+                this.jobFacade.afterJobExecuted(shardingContexts);
+            } catch (Throwable var3) {
+                this.jobExceptionHandler.handleException(this.jobName, var3);
+            }
+
+        }
+    }
+    在execute中会记录一些任务的状态信息，然后执行process方法
+    private void execute(ShardingContexts shardingContexts, ExecutionSource executionSource) {
+        if (shardingContexts.getShardingItemParameters().isEmpty()) {
+            if (shardingContexts.isAllowSendJobEvent()) {
+                this.jobFacade.postJobStatusTraceEvent(shardingContexts.getTaskId(), State.TASK_FINISHED, String.format("Sharding item for job '%s' is empty.", this.jobName));
+            }
+
+        } else {
+            this.jobFacade.registerJobBegin(shardingContexts);
+            String taskId = shardingContexts.getTaskId();
+            if (shardingContexts.isAllowSendJobEvent()) {
+                this.jobFacade.postJobStatusTraceEvent(taskId, State.TASK_RUNNING, "");
+            }
+
+            try {
+                //执行process
+                this.process(shardingContexts, executionSource);
+            } finally {
+                // TODO 考虑增加作业失败的状态，并且考虑如何处理作业失败的整体回路
+                this.jobFacade.registerJobCompleted(shardingContexts);
+                if (this.itemErrorMessages.isEmpty()) {
+                    if (shardingContexts.isAllowSendJobEvent()) {
+                        this.jobFacade.postJobStatusTraceEvent(taskId, State.TASK_FINISHED, "");
+                    }
+                } else if (shardingContexts.isAllowSendJobEvent()) {
+                    this.jobFacade.postJobStatusTraceEvent(taskId, State.TASK_ERROR, this.itemErrorMessages.toString());
+                }
+
+            }
+
+        }
+    }
+    在process方法中，会根据分片数量单任务时直接执行，多任务时添加到线程池执行
+    private void process(final ShardingContexts shardingContexts, ExecutionSource executionSource) {
+        Collection<Integer> items = shardingContexts.getShardingItemParameters().keySet();
+        //如果只存在一个分片则直接执行
+        if (1 == items.size()) {
+            int item = (Integer)shardingContexts.getShardingItemParameters().keySet().iterator().next();
+            JobExecutionEvent jobExecutionEvent = new JobExecutionEvent(shardingContexts.getTaskId(), this.jobName, executionSource, item);
+            this.process(shardingContexts, item, jobExecutionEvent);
+        } else {
+            final CountDownLatch latch = new CountDownLatch(items.size());
+            Iterator i$ = items.iterator();
+            //根据分片数量依次执行分片任务
+            while(i$.hasNext()) {
+                final int each = (Integer)i$.next();
+                final JobExecutionEvent jobExecutionEvent = new JobExecutionEvent(shardingContexts.getTaskId(), this.jobName, executionSource, each);
+                if (this.executorService.isShutdown()) {
+                    return;
+                }
+
+                this.executorService.submit(new Runnable() {
+                    public void run() {
+                        try {
+                            AbstractElasticJobExecutor.this.process(shardingContexts, each, jobExecutionEvent);
+                        } finally {
+                            latch.countDown();
+                        }
+
+                    }
+                });
+            }
+
+            try {
+                //等待所有分片任务执行完毕
+                latch.await();
+            } catch (InterruptedException var8) {
+                Thread.currentThread().interrupt();
+            }
+
+        }
+    }
+    调用子类的process方法根据任务类型去执行
+    调用 protected abstract void process(ShardingContext var1);
+        AbstractElasticJobExecutor三个实现类的com.dangdang.ddframe.job.executor.type.SimpleJobExecutor.process
+            protected void process(ShardingContext shardingContext) {
+                //执行execute中具体自定义的逻辑
+                this.simpleJob.execute(shardingContext);
+            }
+
+
+任务失败转移
+    Elastic-Job中当某个服务器节点与注册中心断开连接(无法进行任务执行)时其需要执行的任务转移到其他节点的过程。
+    FailoverService，作业失效转移服务。
+    FailoverNode，作业失效转移数据存储路径。
+    FailoverListenerManager，作业失效转移监听管理器。
+
+    一 重新分片
+        当服务器节点与注册中心ZK断开链接时，elastic-job需要在下次任务开始时进行重新分片，当ZK节点发生变化时，ListenServersChangedJobListener监听器监听，
+        shardingService进行重新分片标志，在下次任务执行前重新进行任务分片。
+        // 实例节点变更时触发此监听器
+        class ListenServersChangedJobListener extends AbstractJobListener {
+            ListenServersChangedJobListener() {
+            }
+
+            protected void dataChanged(String path, Type eventType, String data) {
+                //如果节点数变更，设置重新分片标志，下次任务执行前会进行重新分片
+                if (!JobRegistry.getInstance().isShutdown(ShardingListenerManager.this.jobName) && (this.isInstanceChange(eventType, path) || this.isServerChange(path))) {
+                    ShardingListenerManager.this.shardingService.setReshardingFlag();
+                }
+
+            }
+
+            private boolean isInstanceChange(Type eventType, String path) {
+                return ShardingListenerManager.this.instanceNode.isInstancePath(path) && Type.NODE_UPDATED != eventType;
+            }
+
+            private boolean isServerChange(String path) {
+                return ShardingListenerManager.this.serverNode.isServerPath(path);
+            }
+        }
+    任务重新分片只是为了解决下次任务执行时，所有的分片任务都是分布到各个实例中，但是当前失效的任务是如何处理的。
+
+    二 任务失效转移
+        所谓失效转移，就是在在执行任务的过程中如果遇到异常，这个分片任务可以在其他节点再次执行。失效转移监听；FailoverListenerManager中的JobCrashedJobListener
+        FailoverListenerManager监听的是ZK中的instance删除事件，
+        首先，在某个任务实例elastic-job会在leader节点下面创建failover节点以及items节点。items节点下会有失效任务实例的原本应该做的分片好。比如，失效的任务实例原来负责分片1和2。那么items节点下就会有名字叫1的子节点，就代表分片1需要转移到其他节点上去运行。如下图：
+        当节点任务失效时会调用JobCrashedJobListener监听器，此监听器会根据实例id获取所有的分片，然后调用FailoverService的setCrashedFailoverFlag方法，将每个分片id写到/jobName/leader/failover/items下
+
+        //任务失效触发监听器
+        class JobCrashedJobListener extends AbstractJobListener {
+            JobCrashedJobListener() {
+            }
+
+            protected void dataChanged(String path, Type eventType, String data) {
+                if (FailoverListenerManager.this.isFailoverEnabled() && Type.NODE_REMOVED == eventType && FailoverListenerManager.this.instanceNode.isInstancePath(path)) {
+                    String jobInstanceId = path.substring(FailoverListenerManager.this.instanceNode.getInstanceFullPath().length() + 1);
+                    if (jobInstanceId.equals(JobRegistry.getInstance().getJobInstance(FailoverListenerManager.this.jobName).getJobInstanceId())) {
+                        return;
+                    }
+                    //将所有分片初始化到注册中心中
+                    List<Integer> failoverItems = FailoverListenerManager.this.failoverService.getFailoverItems(jobInstanceId);
+                    Iterator i$;
+                    int each;
+                    if (!failoverItems.isEmpty()) {
+                        i$ = failoverItems.iterator();
+
+                        while(i$.hasNext()) {
+                            each = (Integer)i$.next();
+                            FailoverListenerManager.this.failoverService.setCrashedFailoverFlag(each);
+                            FailoverListenerManager.this.failoverService.failoverIfNecessary();
+                        }
+                    } else {
+                        i$ = FailoverListenerManager.this.shardingService.getShardingItems(jobInstanceId).iterator();
+
+                        while(i$.hasNext()) {
+                            each = (Integer)i$.next();
+                            FailoverListenerManager.this.failoverService.setCrashedFailoverFlag(each);
+                            FailoverListenerManager.this.failoverService.failoverIfNecessary();
+                        }
+                    }
+                }
+
+            }
+        }
+        在FailoverService方法中调用setCrashedFailoverFlag方法将需要任务转移的分片id进行实例化。
+        //设置失效的分片项标记
+        public void setCrashedFailoverFlag(int item) {
+            if (!this.isFailoverAssigned(item)) {
+                this.jobNodeStorage.createJobNodeIfNeeded(FailoverNode.getItemsNode(item));
+            }
+        }
+        然后接下来调用FailoverService的failoverIfNessary方法，首先判断是否需要失败转移，如果可以需要则只需作业失败转移。
+        //如果需要失效转移, 则执行作业失效转移 会掉
+        public void failoverIfNecessary() {
+            if (this.needFailover()) {
+                this.jobNodeStorage.executeInLeader("leader/failover/latch", new FailoverService.FailoverLeaderExecutionCallback());
+            }
+        }
+        在needFailover方法会对是否需要失效转移进行判断
+        条件一：${JOB_NAME}/leader/failover/items/${ITEM_ID} 有失效转移的作业分片项。
+        条件二：当前作业不在运行中。此条件即是上文提交的作业节点空闲的定义。失效转移： 运行中的作业服务器崩溃不会导致重新分片，只会在下次作业启动时分片。启用失效转移功能可以在本次作业执行过程中，监测其他作业服务器【空闲】，抓取未完成的孤儿分片项执行
+        private boolean needFailover() {
+            return this.jobNodeStorage.isJobNodeExisted("leader/failover/items") && !this.jobNodeStorage.getJobNodeChildrenKeys("leader/failover/items").isEmpty() && !JobRegistry.getInstance().isJobRunning(this.jobName);
+        }
+
+        FailoverLeaderExecutionCallback回调
+        class FailoverLeaderExecutionCallback implements LeaderExecutionCallback {
+            FailoverLeaderExecutionCallback() {
+            }
+
+            public void execute() {
+                //判断需要失效转移
+                if (!JobRegistry.getInstance().isShutdown(FailoverService.this.jobName) && FailoverService.this.needFailover()) {
+                    //获得一个作业分片项
+                    int crashedItem = Integer.parseInt((String)FailoverService.this.jobNodeStorage.getJobNodeChildrenKeys("leader/failover/items").get(0));
+                    FailoverService.log.debug("Failover job '{}' begin, crashed item '{}'", FailoverService.this.jobName, crashedItem);
+                    //设置这个分片项为当前分片项
+                    FailoverService.this.jobNodeStorage.fillEphemeralJobNode(FailoverNode.getExecutionFailoverNode(crashedItem), JobRegistry.getInstance().getJobInstance(FailoverService.this.jobName).getJobInstanceId());
+                    //移除leader/failover/items 中此分片项
+                    FailoverService.this.jobNodeStorage.removeJobNodeIfExisted(FailoverNode.getItemsNode(crashedItem));
+                    JobScheduleController jobScheduleController = JobRegistry.getInstance().getJobScheduleController(FailoverService.this.jobName);
+                    if (null != jobScheduleController) {
+                        //作业执行
+                        jobScheduleController.triggerJob();
+                    }
+
+                }
+            }
+        }
+        调用 JobScheduleController#triggerJob() 方法，立即启动作业。调用该方法，实际作业不会立即执行，而仅仅是进行触发。如果有多个失效转移的作业分片项，多次调用 JobScheduleController#triggerJob() 方法会不会导致作业是并行执行的？答案是不会，因为一个作业的 Quartz 线程数设置为 1。
+
